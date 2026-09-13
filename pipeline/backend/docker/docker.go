@@ -52,6 +52,7 @@ type docker struct {
 	client client.APIClient
 	info   system.Info
 	config config
+	owner  string
 }
 
 const (
@@ -148,6 +149,16 @@ func (e *docker) Load(ctx context.Context) (*backend_types.BackendInfo, error) {
 		return nil, err
 	}
 
+	e.owner = c.String("hostname")
+	if e.owner == "" {
+		e.owner, _ = os.Hostname()
+	}
+	if e.owner == "" {
+		log.Warn().Msg("docker orphan network cleanup disabled: could not determine agent owner")
+	} else if err := cleanupOrphanNetworks(ctx, e.client, e.owner); err != nil {
+		log.Warn().Err(err).Str("owner", e.owner).Msg("could not clean orphan docker workflow networks")
+	}
+
 	return &backend_types.BackendInfo{
 		Platform: e.info.OSType + "/" + normalizeArchType(e.info.Architecture),
 	}, nil
@@ -156,13 +167,15 @@ func (e *docker) Load(ctx context.Context) (*backend_types.BackendInfo, error) {
 func (e *docker) SetupWorkflow(ctx context.Context, conf *backend_types.Config, taskUUID string) error {
 	log.Trace().Str("taskUUID", taskUUID).Msg("create workflow environment")
 
-	_, err := e.client.VolumeCreate(ctx, client.VolumeCreateOptions{
+	volume, err := e.client.VolumeCreate(ctx, client.VolumeCreateOptions{
 		Name:   conf.Volume,
 		Driver: volumeDriver,
+		Labels: workflowResourceLabels(e.owner, taskUUID, dockerResourceVolume),
 	})
 	if err != nil {
 		return err
 	}
+	volumeOwned := hasWorkflowResourceLabels(volume.Volume.Labels, e.owner, taskUUID, dockerResourceVolume)
 
 	networkDriver := networkDriverBridge
 	if e.info.OSType == "windows" {
@@ -171,7 +184,27 @@ func (e *docker) SetupWorkflow(ctx context.Context, conf *backend_types.Config, 
 	_, err = e.client.NetworkCreate(ctx, conf.Network, client.NetworkCreateOptions{
 		Driver:     networkDriver,
 		EnableIPv6: &e.config.enableIPv6,
+		Labels:     workflowResourceLabels(e.owner, taskUUID, dockerResourceNetwork),
 	})
+	if err == nil {
+		return nil
+	}
+
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), workflowSetupRollbackTimeout)
+	defer rollbackCancel()
+
+	var rollbackErr error
+	if cleanupErr := removeOwnedEmptyNetworkWithRetry(rollbackCtx, e.client, conf.Network, e.owner, taskUUID); cleanupErr != nil {
+		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("rollback workflow network '%s': %w", conf.Network, cleanupErr))
+	}
+	if volumeOwned {
+		if _, cleanupErr := e.client.VolumeRemove(rollbackCtx, conf.Volume, client.VolumeRemoveOptions{Force: true}); cleanupErr != nil && !errdefs.IsNotFound(cleanupErr) {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("rollback workflow volume '%s': %w", conf.Volume, cleanupErr))
+		}
+	}
+	if rollbackErr != nil {
+		return errors.Join(err, rollbackErr)
+	}
 	return err
 }
 
@@ -184,6 +217,9 @@ func (e *docker) StartStep(ctx context.Context, step *backend_types.Step, taskUU
 	log.Trace().Str("taskUUID", taskUUID).Msgf("start step %s", step.Name)
 
 	config := e.toConfig(step, options)
+	for key, value := range workflowResourceLabels(e.owner, taskUUID, dockerResourceStep) {
+		config.Labels[key] = value
+	}
 	hostConfig, err := toHostConfig(step, &e.config)
 	if err != nil {
 		return err
@@ -369,12 +405,15 @@ func (e *docker) DestroyStep(ctx context.Context, step *backend_types.Step, task
 func (e *docker) DestroyWorkflow(ctx context.Context, conf *backend_types.Config, taskUUID string) error {
 	log.Trace().Str("taskUUID", taskUUID).Msgf("delete workflow environment")
 
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), workflowCleanupTimeout)
+	defer cleanupCancel()
+
 	errWG := errgroup.Group{}
 
 	for _, stage := range conf.Stages {
 		for _, step := range stage.Steps {
 			errWG.Go(func() error {
-				return e.DestroyStep(ctx, step, taskUUID)
+				return e.DestroyStep(cleanupCtx, step, taskUUID)
 			})
 		}
 	}
@@ -383,8 +422,8 @@ func (e *docker) DestroyWorkflow(ctx context.Context, conf *backend_types.Config
 		log.Error().Err(err).Msgf("could not destroy all containers")
 	}
 
-	_, err := backoff.Retry(ctx, func() (any, error) {
-		_, err := e.client.VolumeRemove(ctx, conf.Volume, client.VolumeRemoveOptions{
+	_, err := backoff.Retry(cleanupCtx, func() (any, error) {
+		_, err := e.client.VolumeRemove(cleanupCtx, conf.Volume, client.VolumeRemoveOptions{
 			Force: true,
 		})
 		if err == nil || !isErrVolumeInUse(err) {
@@ -400,7 +439,10 @@ func (e *docker) DestroyWorkflow(ctx context.Context, conf *backend_types.Config
 		log.Error().Err(err).Msgf("could not remove volume '%s'", conf.Volume)
 	}
 
-	if _, err := e.client.NetworkRemove(ctx, conf.Network, client.NetworkRemoveOptions{}); err != nil {
+	if err := removeNetworkWithRetry(cleanupCtx, func() error {
+		_, err := e.client.NetworkRemove(cleanupCtx, conf.Network, client.NetworkRemoveOptions{})
+		return err
+	}); err != nil {
 		log.Error().Err(err).Msgf("could not remove network '%s'", conf.Network)
 	}
 	return nil
